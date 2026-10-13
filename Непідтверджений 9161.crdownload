@@ -1,0 +1,791 @@
+/* 101matras — вітрина: каталог, товар, кошик, оформлення замовлення. Без збірки, чистий JS. */
+(() => {
+  'use strict';
+
+  const DEMO = !!window.__DEMO__; // режим попереднього перегляду (без сервера)
+  const $ = (s, el = document) => el.querySelector(s);
+  const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+  let app = $('#app');
+  function resetApp() { const n = app.cloneNode(false); app.replaceWith(n); app = n; }
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const money = (n) => `${Math.round(n).toLocaleString('uk-UA').replace(/,/g, ' ')} грн`;
+  const plural = (n, a, b, c) => { const m = n % 10, h = n % 100; return m === 1 && h !== 11 ? a : m >= 2 && m <= 4 && (h < 12 || h > 14) ? b : c; };
+
+  const state = { config: { stores: [], payOnline: false, npSearch: false, phone: '' }, products: [], byId: {}, variants: {}, categories: [], brands: [], descCache: {} };
+
+  // ------------------------------------------------------------------ API
+  async function api(path, opts = {}) {
+    if (DEMO) return demoApi(path, opts);
+    const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw Object.assign(new Error(data.error || 'Помилка зʼєднання'), { data, status: res.status });
+    return data;
+  }
+  function demoApi(path, opts) {
+    const D = window.__DEMO__;
+    if (path === '/api/config') return Promise.resolve(D.config);
+    if (path === '/api/catalog') return Promise.resolve(D.catalog);
+    if (path.startsWith('/api/product/')) {
+      const id = path.split('/').pop();
+      const p = D.catalog.products.find((x) => x.id === id);
+      return Promise.resolve({ ...p, description: D.desc[id] || '' });
+    }
+    if (path === '/api/order') {
+      return new Promise((r) => setTimeout(() => r({ ok: true, ref: 'DEMO1', number: 'ДЕМО', total: JSON.parse(opts.body).items.reduce((s, it) => s + state.variants[it.id].v.price * it.qty, 0), payUrl: null }), 600));
+    }
+    if (path.startsWith('/api/order/')) return Promise.resolve({ found: true, number: 'ДЕМО', paid: false, pay: 'cod' });
+    if (path.startsWith('/api/np/cities')) {
+      const q = decodeURIComponent(path.split('q=')[1] || '').toLowerCase();
+      return Promise.resolve(['Київ', 'Харків', 'Львів', 'Івано-Франківськ', 'Одеса', 'Дніпро'].filter((c) => c.toLowerCase().startsWith(q)).map((c, i) => ({ ref: 'c' + i, name: `м. ${c}` })));
+    }
+    if (path.startsWith('/api/np/warehouses')) return Promise.resolve([1, 2, 3, 4, 5].map((n) => ({ ref: 'w' + n, name: `Відділення №${n}: вул. Центральна, ${n * 7}` })));
+    return Promise.reject(new Error('demo'));
+  }
+
+  // ------------------------------------------------------------------ Кошик
+  const CART_KEY = 'cart101';
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } },
+    set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+  };
+  let cart = store.get(CART_KEY, []);
+  let memCart = null;
+  const getCart = () => memCart || cart;
+  function saveCart(c) { cart = c; memCart = c; store.set(CART_KEY, c); updateCartBadge(); }
+  function addToCart(id, qty = 1) {
+    const c = getCart().slice();
+    const line = c.find((l) => l.id === id);
+    if (line) line.qty = Math.min(20, line.qty + qty); else c.push({ id, qty });
+    saveCart(c);
+  }
+  function cartLines() {
+    return getCart().map((l) => ({ ...l, ...state.variants[l.id] })).filter((l) => l.v);
+  }
+  function updateCartBadge() {
+    const n = cartLines().reduce((s, l) => s + l.qty, 0);
+    const b = $('[data-cart-count]');
+    b.textContent = n;
+    b.hidden = !n;
+  }
+
+  // ------------------------------------------------------------------ Схема ліжка
+  function bedSvg(w, l, size = 34) {
+    if (!w || !l) return '';
+    const max = 220;
+    const bw = Math.max(9, (w / max) * size * 0.95);
+    const bh = Math.max(14, (l / max) * size);
+    const x = (size - bw) / 2;
+    const y = (size - bh) / 2;
+    const pills = w >= 120 ? 2 : 1;
+    const pw = pills === 2 ? (bw - 6) / 2 : Math.min(bw - 4, 12);
+    let p = '';
+    for (let i = 0; i < pills; i++) {
+      const px = pills === 2 ? x + 2 + i * (pw + 2) : x + (bw - pw) / 2;
+      p += `<rect class="pillow" x="${px.toFixed(1)}" y="${(y + 2).toFixed(1)}" width="${pw.toFixed(1)}" height="${Math.max(2.5, bh * 0.12).toFixed(1)}" rx="1"/>`;
+    }
+    return `<svg class="bed" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" aria-hidden="true"><rect class="frame" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${bh.toFixed(1)}" rx="2"/>${p}</svg>`;
+  }
+
+  // ------------------------------------------------------------------ Роутер
+  const routes = [];
+  const route = (re, fn) => routes.push([re, fn]);
+  function currentPath() {
+    if (DEMO) { const h = location.hash.slice(1) || '/'; return h; }
+    return location.pathname + location.search;
+  }
+  function navigate(url, replace = false) {
+    if (DEMO) { if (replace) history.replaceState(null, '', '#' + url); else location.hash = url; if (replace) render(); return; }
+    if (replace) history.replaceState(null, '', url); else history.pushState(null, '', url);
+    render();
+  }
+  function render() {
+    const full = currentPath();
+    const [path, qs] = full.split('?');
+    const params = new URLSearchParams(qs || '');
+    resetApp();
+    for (const [re, fn] of routes) {
+      const m = path.match(re);
+      if (m) { fn(m, params); break; }
+    }
+    $$('.cats a').forEach((a) => {
+      const href = a.getAttribute('href').replace(/^#/, '');
+      a.toggleAttribute('aria-current', href === path || (href !== '/' && path.startsWith(href)));
+      if (a.hasAttribute('aria-current')) a.setAttribute('aria-current', 'page');
+    });
+  }
+  const href = (u) => (DEMO ? '#' + u : u);
+  document.addEventListener('click', (e) => {
+    const a = e.target.closest('a[data-link]');
+    if (!a || e.metaKey || e.ctrlKey || e.shiftKey || a.target) return;
+    e.preventDefault();
+    navigate(a.getAttribute('href').replace(/^#/, ''));
+    window.scrollTo(0, 0);
+  });
+  window.addEventListener(DEMO ? 'hashchange' : 'popstate', render);
+
+  function setTitle(t) { document.title = t ? `${t} — 101matras` : '101matras — матраци, топери, подушки, ковдри'; }
+  function toast(html) {
+    const t = $('[data-toast]');
+    t.innerHTML = html;
+    t.classList.add('show');
+    clearTimeout(toast.t);
+    toast.t = setTimeout(() => t.classList.remove('show'), 3800);
+  }
+
+  // ------------------------------------------------------------------ Картка товару
+  function cardHtml(p, sizeSet) {
+    let vs = p.variants;
+    if (sizeSet && sizeSet.size) vs = vs.filter((v) => sizeSet.has(v.label));
+    const min = Math.min(...vs.map((v) => v.price));
+    const cheapest = vs.find((v) => v.price === min);
+    const old = cheapest.old;
+    const inStock = vs.some((v) => v.av);
+    const one = sizeSet && sizeSet.size === 1;
+    const sizeCount = new Set(p.variants.map((v) => v.label)).size;
+    const meta = one ? `Розмір ${esc(cheapest.label)}` : sizeCount > 1 ? `${sizeCount} ${plural(sizeCount, 'розмір', 'розміри', 'розмірів')}` : '';
+    const url = `/p/${p.id}${one ? '?v=' + cheapest.id : ''}`;
+    const disc = old ? Math.round((1 - min / old) * 100) : 0;
+    return `<a class="card" href="${href(url)}" data-link>
+      <div class="card-img">${p.pics[0] ? `<img src="${esc(p.pics[0])}" alt="" loading="lazy">` : ''}${disc >= 5 ? `<span class="badge">−${disc}%</span>` : ''}</div>
+      <div class="card-body">
+        <span class="card-brand">${esc(p.brand)}</span>
+        <span class="card-name">${esc(p.name)}</span>
+        <span class="card-meta">${meta}${meta ? ' · ' : ''}<span class="stock${inStock ? ' in' : ''}">${inStock ? 'В наявності' : 'Під замовлення'}</span></span>
+        <span class="price${old ? ' sale' : ''}"><b>${one || vs.length === 1 ? '' : 'від '}${money(min)}</b>${old ? `<s>${money(old)}</s>` : ''}</span>
+      </div></a>`;
+  }
+
+  // ------------------------------------------------------------------ Головна
+  const POPULAR_SIZES = ['70×190', '80×190', '80×200', '90×190', '90×200', '120×200', '140×190', '140×200', '160×190', '160×200', '180×200', '200×200'];
+  function sizeStats(type) {
+    const m = {};
+    for (const p of state.products) {
+      if (type && p.type !== type) continue;
+      for (const v of p.variants) if (v.w) { (m[v.label] ||= { label: v.label, w: v.w, l: v.l, min: Infinity, n: 0 }); m[v.label].min = Math.min(m[v.label].min, v.price); m[v.label].n++; }
+    }
+    return m;
+  }
+
+  route(/^\/$/, () => {
+    setTitle('');
+    const cats = state.categories;
+    const sale = state.products.filter((p) => p.disc >= 10).sort((a, b) => b.disc - a.disc).slice(0, 8);
+    const stock = state.products.filter((p) => p.inStock && p.type === 'mattresses').slice(0, 8);
+    let heroType = 'mattresses';
+    app.innerHTML = `
+      <section class="hero"><div class="wrap hero-in">
+        <div>
+          <h1>Матрац під розмір вашого ліжка</h1>
+          <p>${state.products.length} ${plural(state.products.length, 'модель', 'моделі', 'моделей')} матраців, топерів і постільного від українських та європейських виробників. Доставка Новою поштою по всій Україні.</p>
+        </div>
+        <div class="hero-pick">
+          <h2>Який розмір вашого ліжка?</h2>
+          <p class="hint">Оберіть — покажемо все, що підходить, з ціною саме за цей розмір</p>
+          <div class="hero-types" role="group" aria-label="Що шукаєте">
+            ${['mattresses', 'toppers', 'protectors'].filter((t) => cats.some((c) => c.id === t)).map((t) => `<button class="chip" data-ht="${t}" aria-pressed="${t === heroType}">${esc(cats.find((c) => c.id === t).name)}</button>`).join('')}
+          </div>
+          <div class="hero-beds" data-hero-beds></div>
+        </div>
+      </div></section>
+      <div class="wrap">
+        <section class="section">
+          <div class="section-head"><h2>Категорії</h2></div>
+          <div class="tiles">${cats.map((c) => {
+            const p = state.products.find((x) => x.type === c.id && x.pics[0]);
+            return `<a class="tile" href="${href('/c/' + c.id)}" data-link>${p ? `<img src="${esc(p.pics[0])}" alt="" loading="lazy">` : ''}<b>${esc(c.name)}</b><span>${c.count} ${plural(c.count, 'модель', 'моделі', 'моделей')}</span></a>`;
+          }).join('')}</div>
+        </section>
+        ${sale.length ? `<section class="section"><div class="section-head"><h2>Зі знижкою</h2><a href="${href('/sale')}" data-link>Усі знижки</a></div><div class="grid wide">${sale.map((p) => cardHtml(p)).join('')}</div></section>` : ''}
+        ${stock.length ? `<section class="section"><div class="section-head"><h2>Матраци в наявності</h2><a href="${href('/c/mattresses?stock=1')}" data-link>Дивитись усі</a></div><div class="grid wide">${stock.map((p) => cardHtml(p)).join('')}</div></section>` : ''}
+        ${factsHtml()}
+      </div>`;
+    const drawBeds = () => {
+      const st = sizeStats(heroType);
+      const list = POPULAR_SIZES.filter((s) => st[s]).map((s) => st[s]);
+      $('[data-hero-beds]').innerHTML = list.map((s) => `<a class="size" href="${href(`/c/${heroType}?size=${encodeURIComponent(s.label)}`)}" data-link>${bedSvg(s.w, s.l, 40)}<span>${s.label}</span><span class="sz-price">від ${money(s.min)}</span></a>`).join('');
+    };
+    drawBeds();
+    $$('[data-ht]').forEach((b) => b.addEventListener('click', () => {
+      heroType = b.dataset.ht;
+      $$('[data-ht]').forEach((x) => x.setAttribute('aria-pressed', x === b));
+      drawBeds();
+    }));
+  });
+
+  function factsHtml() {
+    const st = state.config.stores;
+    return `<section class="facts">
+      <div><h3>Доставка по Україні</h3><p>Новою поштою у відділення, поштомат або курʼєром до дверей. Матраци в рулоні вміщаються навіть у ліфт.</p></div>
+      <div><h3>Оплата</h3><p>${state.config.payOnline ? 'Карткою онлайн, Apple Pay / Google Pay, ' : ''}${state.config.payOnline ? 'або' : 'Оплата'} при отриманні на пошті. У магазині — готівкою чи карткою.</p></div>
+      <div><h3>Можна полежати перед покупкою</h3><p>${st.length} ${plural(st.length, 'магазин', 'магазини', 'магазинів')}: ${esc(st.join('; '))}. Самовивіз — безкоштовно.</p></div>
+    </section>`;
+  }
+
+  // ------------------------------------------------------------------ Каталог
+  const SORTS = { pop: 'Спочатку популярні', cheap: 'Спочатку дешевші', exp: 'Спочатку дорожчі', disc: 'Найбільша знижка' };
+  const HEIGHTS = [['low', 'до 10 см', (h) => h < 10], ['mid', '10–20 см', (h) => h >= 10 && h <= 20], ['high', 'понад 20 см', (h) => h > 20]];
+
+  function readFilters(params) {
+    const set = (k) => new Set(params.getAll(k).flatMap((x) => x.split(',')).filter(Boolean));
+    return {
+      size: set('size'), brand: set('brand'), spring: set('spring'), firm: set('firm'), height: set('height'),
+      stock: params.get('stock') === '1', min: +params.get('min') || 0, max: +params.get('max') || 0,
+      sort: SORTS[params.get('sort')] ? params.get('sort') : 'pop', q: (params.get('q') || '').trim(),
+    };
+  }
+  function filtersToQs(f) {
+    const p = new URLSearchParams();
+    if (f.q) p.set('q', f.q);
+    for (const k of ['size', 'brand', 'spring', 'firm', 'height']) if (f[k].size) p.set(k, [...f[k]].join(','));
+    if (f.stock) p.set('stock', '1');
+    if (f.min) p.set('min', f.min);
+    if (f.max) p.set('max', f.max);
+    if (f.sort !== 'pop') p.set('sort', f.sort);
+    const s = p.toString();
+    return s ? '?' + s : '';
+  }
+  function matchProduct(p, f, skip) {
+    let vs = p.variants;
+    if (f.size.size && skip !== 'size') { vs = vs.filter((v) => f.size.has(v.label)); if (!vs.length) return null; }
+    if (f.stock) { vs = vs.filter((v) => v.av); if (!vs.length) return null; }
+    if (f.brand.size && skip !== 'brand' && !f.brand.has(p.brand)) return null;
+    if (f.spring.size && skip !== 'spring' && !f.spring.has(p.attrs.spring)) return null;
+    if (f.firm.size && skip !== 'firm' && !(p.attrs.firmTags || []).some((t) => f.firm.has(t))) return null;
+    if (f.height.size && skip !== 'height' && !HEIGHTS.some(([k, , fn]) => f.height.has(k) && p.attrs.height && fn(p.attrs.height))) return null;
+    const price = Math.min(...vs.map((v) => v.price));
+    if (f.min && price < f.min) return null;
+    if (f.max && price > f.max) return null;
+    if (f.q) {
+      const hay = `${p.name} ${p.brand}`.toLowerCase();
+      if (!f.q.toLowerCase().split(/\s+/).every((w) => hay.includes(w))) return null;
+    }
+    return { p, price, disc: Math.max(0, ...vs.map((v) => (v.old ? 1 - v.price / v.old : 0))) };
+  }
+
+  function catalogPage(base, params, opts) {
+    const f = readFilters(params);
+    const pool = opts.pool;
+    const results = pool.map((p) => matchProduct(p, f)).filter(Boolean);
+    if (f.sort === 'cheap') results.sort((a, b) => a.price - b.price);
+    else if (f.sort === 'exp') results.sort((a, b) => b.price - a.price);
+    else if (f.sort === 'disc') results.sort((a, b) => b.disc - a.disc);
+    setTitle(opts.title);
+
+    const count = (key, val, test) => pool.filter((p) => matchProduct(p, f, key) && test(p)).length;
+    const sizeSt = {};
+    pool.forEach((p) => p.variants.forEach((v) => { if (v.w) sizeSt[v.label] ||= v; }));
+    const sizeList = Object.values(sizeSt).sort((a, b) => a.w - b.w || a.l - b.l);
+    const brands = [...new Set(pool.map((p) => p.brand))].sort((a, b) => a.localeCompare(b));
+    const springs = [...new Set(pool.map((p) => p.attrs.spring).filter(Boolean))];
+    const firms = ["М'яка", 'Середня', 'Жорстка'].filter((t) => pool.some((p) => (p.attrs.firmTags || []).includes(t)));
+    const heights = HEIGHTS.filter(([, , fn]) => pool.some((p) => p.attrs.height && fn(p.attrs.height)));
+
+    const checks = (key, items, label = (x) => x, val = (x) => x, test) => items.map((it) => {
+      const v = val(it);
+      const n = count(key, v, (p) => test(p, v));
+      return `<label class="check"><input type="checkbox" data-f="${key}" value="${esc(v)}" ${f[key].has(v) ? 'checked' : ''}>${esc(label(it))}<small>${n}</small></label>`;
+    }).join('');
+
+    const filtersHtml = `
+      ${sizeList.length > 1 ? `<div class="fgroup"><h3>Розмір</h3><div class="sizes">${sizeList.map((v) => `<button type="button" class="size" data-size="${esc(v.label)}" aria-pressed="${f.size.has(v.label)}">${bedSvg(v.w, v.l, 28)}<span>${esc(v.label)}</span></button>`).join('')}</div></div>` : ''}
+      <div class="fgroup"><h3>Ціна, грн</h3><div class="range"><input type="number" inputmode="numeric" placeholder="від" data-min value="${f.min || ''}" aria-label="Ціна від"><span>–</span><input type="number" inputmode="numeric" placeholder="до" data-max value="${f.max || ''}" aria-label="Ціна до"></div></div>
+      <div class="fgroup"><label class="check"><input type="checkbox" data-stock ${f.stock ? 'checked' : ''}>Тільки в наявності</label></div>
+      ${springs.length > 1 ? `<div class="fgroup"><h3>Тип</h3>${checks('spring', springs, (x) => x, (x) => x, (p, v) => p.attrs.spring === v)}</div>` : ''}
+      ${firms.length > 1 ? `<div class="fgroup"><h3>Жорсткість</h3>${checks('firm', firms, (x) => x, (x) => x, (p, v) => (p.attrs.firmTags || []).includes(v))}</div>` : ''}
+      ${heights.length > 1 ? `<div class="fgroup"><h3>Висота</h3>${checks('height', heights, (x) => x[1], (x) => x[0], (p, v) => { const h = HEIGHTS.find((x) => x[0] === v); return p.attrs.height && h[2](p.attrs.height); })}</div>` : ''}
+      ${brands.length > 1 ? `<div class="fgroup"><h3>Бренд</h3>${checks('brand', brands, (x) => x, (x) => x, (p, v) => p.brand === v)}</div>` : ''}`;
+
+    const pills = [];
+    f.size.forEach((v) => pills.push(['size', v, v]));
+    f.brand.forEach((v) => pills.push(['brand', v, v]));
+    f.spring.forEach((v) => pills.push(['spring', v, v]));
+    f.firm.forEach((v) => pills.push(['firm', v, `Жорсткість: ${v.toLowerCase()}`]));
+    f.height.forEach((v) => pills.push(['height', v, `Висота ${HEIGHTS.find((h) => h[0] === v)?.[1] || v}`]));
+    if (f.stock) pills.push(['stock', '1', 'В наявності']);
+    if (f.min || f.max) pills.push(['price', '', `Ціна ${f.min || 0}–${f.max || '…'} грн`]);
+    if (f.q && opts.showQuery) pills.push(['q', f.q, `«${f.q}»`]);
+
+    const LIMIT_STEP = 24;
+    let limit = LIMIT_STEP;
+    app.innerHTML = `<div class="wrap">
+      <div class="page-head"><div class="crumbs"><a href="${href('/')}" data-link>Головна</a> / ${esc(opts.title)}</div><h1>${esc(opts.heading || opts.title)}</h1></div>
+      <div class="catalog">
+        <aside class="filters" aria-label="Фільтри">${filtersHtml}</aside>
+        <div>
+          <div class="toolbar">
+            <span class="count">${results.length} ${plural(results.length, 'товар', 'товари', 'товарів')}</span>
+            <button class="btn btn-ghost filters-open" type="button" data-open-filters>Фільтри${pills.length ? ` (${pills.length})` : ''}</button>
+            <label class="sr" for="sort">Сортування</label>
+            <select id="sort" data-sort>${Object.entries(SORTS).map(([k, v]) => `<option value="${k}" ${f.sort === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
+          </div>
+          ${pills.length ? `<div class="active-filters">${pills.map(([k, v, t]) => `<button class="pill" data-rm="${k}" data-v="${esc(v)}">${esc(t)}</button>`).join('')}${pills.length > 1 ? '<button class="link-btn" data-clear>Скинути все</button>' : ''}</div>` : ''}
+          <div class="grid" data-grid></div>
+          <div style="text-align:center;margin-top:28px" data-more-wrap></div>
+          ${results.length ? '' : `<div class="empty"><h2>Нічого не знайшли</h2><p class="muted">Приберіть частину фільтрів або спробуйте інший розмір.</p>${pills.length ? '<button class="btn btn-ghost" data-clear>Скинути фільтри</button>' : ''}</div>`}
+        </div>
+      </div></div>
+      <dialog class="sheet" data-sheet><div class="sheet-in"><div class="sheet-head"><h2>Фільтри</h2><button class="x-btn" data-close aria-label="Закрити">✕</button></div><div class="sheet-body">${filtersHtml}</div><div class="sheet-foot"><button class="btn btn-primary btn-block" data-close>Показати ${results.length} ${plural(results.length, 'товар', 'товари', 'товарів')}</button></div></div></dialog>`;
+
+    const grid = $('[data-grid]');
+    const drawGrid = () => {
+      grid.innerHTML = results.slice(0, limit).map((r) => cardHtml(r.p, f.size)).join('');
+      const left = results.length - limit;
+      $('[data-more-wrap]').innerHTML = left > 0 ? `<button class="btn btn-ghost" data-more>Показати ще ${Math.min(left, LIMIT_STEP)}</button>` : '';
+    };
+    drawGrid();
+
+    const go = (nf) => navigate(base + filtersToQs(nf), true);
+    const clone = () => ({ ...f, size: new Set(f.size), brand: new Set(f.brand), spring: new Set(f.spring), firm: new Set(f.firm), height: new Set(f.height) });
+    const sheet = $('[data-sheet]');
+    const reopen = sheet.open;
+    app.addEventListener('click', function onClick(e) {
+      const t = e.target;
+      if (t.closest('[data-more]')) { limit += LIMIT_STEP; drawGrid(); return; }
+      const sz = t.closest('[data-size]');
+      if (sz) { const nf = clone(); nf.size.has(sz.dataset.size) ? nf.size.delete(sz.dataset.size) : nf.size.add(sz.dataset.size); keepSheet(); return go(nf); }
+      const rm = t.closest('[data-rm]');
+      if (rm) {
+        const nf = clone(); const k = rm.dataset.rm;
+        if (k === 'stock') nf.stock = false; else if (k === 'price') { nf.min = 0; nf.max = 0; } else if (k === 'q') nf.q = ''; else nf[k].delete(rm.dataset.v);
+        return go(nf);
+      }
+      if (t.closest('[data-clear]')) return go({ ...readFilters(new URLSearchParams()), sort: f.sort, q: opts.showQuery ? '' : f.q });
+      if (t.closest('[data-open-filters]')) { sheet.showModal(); return; }
+      if (t.closest('[data-close]')) { sheet.close(); return; }
+    }, { once: false });
+    app.addEventListener('change', (e) => {
+      const t = e.target;
+      const nf = clone();
+      if (t.dataset.f) { t.checked ? nf[t.dataset.f].add(t.value) : nf[t.dataset.f].delete(t.value); keepSheet(); return go(nf); }
+      if (t.matches('[data-stock]')) { nf.stock = t.checked; keepSheet(); return go(nf); }
+      if (t.matches('[data-sort]')) { nf.sort = t.value; return go(nf); }
+      if (t.matches('[data-min],[data-max]')) {
+        const box = t.closest('.range');
+        nf.min = Math.max(0, +$('[data-min]', box).value || 0);
+        nf.max = Math.max(0, +$('[data-max]', box).value || 0);
+        keepSheet();
+        return go(nf);
+      }
+    });
+    if (window.__keepSheet && window.matchMedia('(max-width: 959px)').matches) { sheet.showModal(); }
+    window.__keepSheet = false;
+    function keepSheet() { window.__keepSheet = sheet.open; }
+    void reopen;
+  }
+
+  route(/^\/c\/([a-z]+)$/, (m, params) => {
+    const cat = state.categories.find((c) => c.id === m[1]);
+    if (!cat) return notFound();
+    catalogPage(`/c/${cat.id}`, params, { title: cat.name, pool: state.products.filter((p) => p.type === cat.id) });
+  });
+  route(/^\/sale$/, (m, params) => {
+    catalogPage('/sale', params, { title: 'Знижки', pool: state.products.filter((p) => p.disc > 0) });
+  });
+  route(/^\/search$/, (m, params) => {
+    const q = (params.get('q') || '').trim();
+    $('#q').value = q;
+    catalogPage('/search', params, { title: 'Пошук', heading: q ? `Пошук: «${q}»` : 'Пошук', pool: state.products, showQuery: true });
+  });
+
+  // ------------------------------------------------------------------ Товар
+  route(/^\/p\/([\w-]+)$/, async (m, params) => {
+    const p = state.byId[m[1]];
+    if (!p) return notFound();
+    setTitle(p.name);
+    const opts = [...new Set(p.variants.map((v) => v.opt).filter(Boolean))];
+    let v = p.variants.find((x) => x.id === params.get('v')) || p.variants.find((x) => x.av) || p.variants[0];
+    let qty = 1;
+    const catName = state.categories.find((c) => c.id === p.type)?.name || 'Каталог';
+
+    const specs = [];
+    if (p.attrs.spring) specs.push(['Тип', p.attrs.spring]);
+    if (p.attrs.firmness) specs.push(['Жорсткість', p.attrs.firmness]);
+    if (p.attrs.height) specs.push(['Висота', `${String(p.attrs.height).replace('.', ',')} см`]);
+    if (p.attrs.load) specs.push(['Навантаження на спальне місце', typeof p.attrs.load === 'number' ? `до ${p.attrs.load} кг` : p.attrs.load]);
+    if (p.attrs.roll) specs.push(['Упаковка', 'Вакуумна, скручений у рулон']);
+    if (p.warranty) specs.push(['Гарантія', p.warranty.replace('мес.', 'міс.')]);
+    specs.push(['Бренд', p.brand]);
+
+    app.innerHTML = `<div class="wrap">
+      <div class="page-head" style="padding-bottom:6px"><div class="crumbs"><a href="${href('/')}" data-link>Головна</a> / <a href="${href('/c/' + p.type)}" data-link>${esc(catName)}</a></div></div>
+      <div class="product">
+        <div class="gallery" data-gallery></div>
+        <div class="p-info">
+          <div class="p-brand">${esc(p.brand)}</div>
+          <h1>${esc(p.name)}</h1>
+          ${opts.length > 1 ? `<div class="p-block"><h2>Варіант</h2><div class="opts" role="radiogroup" aria-label="Варіант" data-opts></div></div>` : ''}
+          <div class="p-block" data-size-block><h2>Розмір</h2><div class="sizes" role="radiogroup" aria-label="Розмір" data-sizes></div></div>
+          <div class="buy" data-buy></div>
+          ${specs.length ? `<div class="p-block"><h2>Характеристики</h2><table class="specs">${specs.map(([k, val]) => `<tr><th>${esc(k)}</th><td>${esc(val)}</td></tr>`).join('')}</table></div>` : ''}
+        </div>
+      </div>
+      <section class="desc" data-desc></section>
+    </div>`;
+
+    const drawGallery = () => {
+      const pics = (v.pics && v.pics.length ? v.pics : p.pics).slice(0, 12);
+      $('[data-gallery]').innerHTML = `<div class="g-main" data-gmain>${pics.map((u, i) => `<img src="${esc(u)}" alt="${esc(p.name)}${i ? ', фото ' + (i + 1) : ''}" ${i ? 'loading="lazy"' : ''}>`).join('')}</div>
+        ${pics.length > 1 ? `<div class="g-thumbs">${pics.map((u, i) => `<button type="button" data-thumb="${i}" aria-label="Фото ${i + 1}" aria-current="${i === 0}"><img src="${esc(u)}" alt="" loading="lazy"></button>`).join('')}</div>` : ''}`;
+      const main = $('[data-gmain]');
+      $$('[data-thumb]').forEach((b) => b.addEventListener('click', () => {
+        main.scrollTo({ left: main.clientWidth * +b.dataset.thumb, behavior: 'smooth' });
+      }));
+      main.addEventListener('scroll', () => {
+        const i = Math.round(main.scrollLeft / main.clientWidth);
+        $$('[data-thumb]').forEach((b) => b.setAttribute('aria-current', +b.dataset.thumb === i));
+      }, { passive: true });
+    };
+    let galleryKey = '';
+    const draw = () => {
+      const curOpt = v.opt;
+      const pool = opts.length > 1 ? p.variants.filter((x) => x.opt === curOpt) : p.variants;
+      if (opts.length > 1) {
+        $('[data-opts]').innerHTML = opts.map((o) => `<button type="button" class="opt" role="radio" aria-checked="${o === curOpt}" data-opt="${esc(o)}">${esc(o)}</button>`).join('');
+      }
+      const showSizes = pool.length > 1 || (pool[0] && pool[0].w);
+      $('[data-size-block]').hidden = !showSizes || (pool.length === 1 && !pool[0].w);
+      $('[data-sizes]').innerHTML = pool.map((x) => `<button type="button" class="size${x.av ? '' : ' out'}" role="radio" aria-checked="${x.id === v.id}" data-vid="${x.id}">${bedSvg(x.w, x.l, 32)}<span>${esc(x.label)}</span><span class="sz-price">${money(x.price)}</span></button>`).join('');
+      const disc = v.old ? Math.round((1 - v.price / v.old) * 100) : 0;
+      $('[data-buy]').innerHTML = `
+        <div class="price${v.old ? ' sale' : ''}"><b>${money(v.price)}</b>${v.old ? `<s>${money(v.old)}</s> <span class="badge" style="position:static">−${disc}%</span>` : ''}</div>
+        <div class="p-row"><span class="stock${v.av ? ' in' : ''}">${v.av ? 'В наявності' : 'Під замовлення — термін уточнить менеджер'}</span>${v.label && v.label !== 'Стандарт' ? `<span class="muted">Розмір ${esc(v.label)}${v.opt ? ', ' + esc(v.opt) : ''}</span>` : ''}</div>
+        <div class="buy-actions">
+          <div class="qty" aria-label="Кількість"><button type="button" data-q="-1" aria-label="Менше">−</button><input type="number" min="1" max="20" value="${qty}" data-qty aria-label="Кількість"><button type="button" data-q="1" aria-label="Більше">+</button></div>
+          <button class="btn btn-primary" data-add>Додати в кошик</button>
+          <button class="btn btn-teal" data-buynow>Купити зараз</button>
+        </div>
+        <p class="note">Доставка Новою поштою по Україні або самовивіз з магазину. Оплата ${state.config.payOnline ? 'карткою онлайн або ' : ''}при отриманні.</p>`;
+      const key = (v.pics || p.pics).join();
+      if (key !== galleryKey) { galleryKey = key; drawGallery(); }
+    };
+    draw();
+
+    app.addEventListener('click', (e) => {
+      const t = e.target;
+      const o = t.closest('[data-opt]');
+      if (o) {
+        const same = p.variants.filter((x) => x.opt === o.dataset.opt);
+        v = same.find((x) => x.label === v.label) || same.find((x) => x.av) || same[0];
+        draw(); syncUrl(); return;
+      }
+      const s = t.closest('[data-vid]');
+      if (s) { v = p.variants.find((x) => x.id === s.dataset.vid); draw(); syncUrl(); return; }
+      const q = t.closest('[data-q]');
+      if (q) { qty = Math.max(1, Math.min(20, qty + +q.dataset.q)); $('[data-qty]').value = qty; return; }
+      if (t.closest('[data-add]')) {
+        addToCart(v.id, qty);
+        toast(`Додано в кошик: ${esc(p.name)} ${esc(v.label)} <a href="${href('/cart')}" data-link>Відкрити кошик</a>`);
+        return;
+      }
+      if (t.closest('[data-buynow]')) { addToCart(v.id, qty); navigate('/checkout'); window.scrollTo(0, 0); }
+    });
+    app.addEventListener('change', (e) => {
+      if (e.target.matches('[data-qty]')) { qty = Math.max(1, Math.min(20, parseInt(e.target.value, 10) || 1)); e.target.value = qty; }
+    });
+    const syncUrl = () => { if (!DEMO) history.replaceState(null, '', `/p/${p.id}?v=${v.id}`); };
+
+    // опис
+    try {
+      const full = state.descCache[p.id] || (state.descCache[p.id] = await api(`/api/product/${p.id}`));
+      if (full.description) $('[data-desc]').innerHTML = `<h2>Опис</h2><div class="desc-body">${full.description}</div>`;
+    } catch {}
+  });
+
+  // ------------------------------------------------------------------ Кошик
+  route(/^\/cart$/, () => {
+    setTitle('Кошик');
+    const draw = () => {
+      const lines = cartLines();
+      const total = lines.reduce((s, l) => s + l.v.price * l.qty, 0);
+      const n = lines.reduce((s, l) => s + l.qty, 0);
+      if (!lines.length) {
+        app.innerHTML = `<div class="wrap"><div class="page-head"><h1>Кошик</h1></div><div class="empty"><h2>У кошику поки порожньо</h2><p class="muted">Почніть з розміру вашого ліжка — так простіше знайти потрібне.</p><a class="btn btn-primary" href="${href('/')}" data-link>Обрати матрац</a></div></div>`;
+        return;
+      }
+      app.innerHTML = `<div class="wrap"><div class="page-head"><h1>Кошик</h1></div>
+        <div class="two"><ul class="lines">${lines.map((l) => `<li class="line">
+          <a class="line-img" href="${href(`/p/${l.p.id}?v=${l.v.id}`)}" data-link>${(l.v.pics || l.p.pics)[0] ? `<img src="${esc((l.v.pics || l.p.pics)[0])}" alt="">` : ''}</a>
+          <div><a class="line-name" href="${href(`/p/${l.p.id}?v=${l.v.id}`)}" data-link>${esc(l.p.name)}</a>
+            <div class="line-sub">${l.v.label !== 'Стандарт' ? 'Розмір ' + esc(l.v.label) : ''}${l.v.opt ? ', ' + esc(l.v.opt) : ''} · ${money(l.v.price)} · <span class="stock${l.v.av ? ' in' : ''}">${l.v.av ? 'В наявності' : 'Під замовлення'}</span></div>
+            <div class="line-bottom">
+              <div class="qty"><button type="button" data-cq="-1" data-id="${l.id}" aria-label="Менше">−</button><input type="number" value="${l.qty}" min="1" max="20" data-cqty="${l.id}" aria-label="Кількість"><button type="button" data-cq="1" data-id="${l.id}" aria-label="Більше">+</button></div>
+              <button class="link-btn" data-del="${l.id}">Видалити</button>
+              <span class="line-sum">${money(l.v.price * l.qty)}</span>
+            </div></div></li>`).join('')}</ul>
+          <aside class="summary"><h2>Разом</h2>
+            <div class="sum-row"><span>${n} ${plural(n, 'товар', 'товари', 'товарів')}</span><span>${money(total)}</span></div>
+            <div class="sum-row"><span>Доставка</span><span class="muted">за тарифами перевізника</span></div>
+            <div class="sum-row sum-total"><span>До сплати</span><span>${money(total)}</span></div>
+            <a class="btn btn-primary btn-block" style="margin-top:16px" href="${href('/checkout')}" data-link>Оформити замовлення</a>
+          </aside></div></div>`;
+    };
+    draw();
+    const setQty = (id, q) => { saveCart(getCart().map((l) => (l.id === id ? { ...l, qty: Math.max(1, Math.min(20, q)) } : l))); draw(); };
+    app.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-cq]');
+      if (b) { const l = getCart().find((x) => x.id === b.dataset.id); if (l) setQty(l.id, l.qty + +b.dataset.cq); return; }
+      const d = e.target.closest('[data-del]');
+      if (d) { saveCart(getCart().filter((l) => l.id !== d.dataset.del)); draw(); }
+    });
+    app.addEventListener('change', (e) => { if (e.target.dataset.cqty) setQty(e.target.dataset.cqty, parseInt(e.target.value, 10) || 1); });
+  });
+
+  // ------------------------------------------------------------------ Оформлення
+  function combo(input, { load, onPick, minLen = 2, empty = 'Нічого не знайдено' }) {
+    const box = input.closest('.combo');
+    const list = document.createElement('ul');
+    list.className = 'combo-list';
+    list.setAttribute('role', 'listbox');
+    list.hidden = true;
+    box.appendChild(list);
+    input.setAttribute('role', 'combobox');
+    input.setAttribute('aria-autocomplete', 'list');
+    input.setAttribute('aria-expanded', 'false');
+    let items = [], active = -1, timer, seq = 0;
+    const close = () => { list.hidden = true; input.setAttribute('aria-expanded', 'false'); };
+    const show = () => {
+      list.innerHTML = items.length ? items.map((it, i) => `<li role="option" data-i="${i}" aria-selected="${i === active}">${esc(it.name)}</li>`).join('') : `<li class="none">${empty}</li>`;
+      list.hidden = false;
+      input.setAttribute('aria-expanded', 'true');
+    };
+    const pick = (i) => { const it = items[i]; if (!it) return; input.value = it.name; close(); onPick(it); };
+    input.addEventListener('input', () => {
+      onPick(null);
+      clearTimeout(timer);
+      const q = input.value.trim();
+      if (q.length < minLen) { close(); return; }
+      timer = setTimeout(async () => {
+        const my = ++seq;
+        try { const r = await load(q); if (my !== seq) return; items = r; active = -1; show(); } catch { close(); }
+      }, 250);
+    });
+    input.addEventListener('focus', async () => { if (minLen === 0) { items = await load(input.value.trim()).catch(() => []); active = -1; show(); } });
+    input.addEventListener('keydown', (e) => {
+      if (list.hidden) return;
+      if (e.key === 'ArrowDown') { active = Math.min(items.length - 1, active + 1); show(); e.preventDefault(); }
+      else if (e.key === 'ArrowUp') { active = Math.max(0, active - 1); show(); e.preventDefault(); }
+      else if (e.key === 'Enter' && active >= 0) { pick(active); e.preventDefault(); }
+      else if (e.key === 'Escape') close();
+    });
+    list.addEventListener('mousedown', (e) => { const li = e.target.closest('[data-i]'); if (li) { e.preventDefault(); pick(+li.dataset.i); } });
+    input.addEventListener('blur', () => setTimeout(close, 150));
+    return { reset() { items = []; close(); } };
+  }
+
+  route(/^\/checkout$/, () => {
+    setTitle('Оформлення замовлення');
+    const lines = cartLines();
+    if (!lines.length) { navigate('/cart', true); return; }
+    const cfg = state.config;
+    const total = lines.reduce((s, l) => s + l.v.price * l.qty, 0);
+    const saved = store.get('buyer101', {});
+    const hasOut = lines.some((l) => !l.v.av);
+
+    app.innerHTML = `<div class="wrap"><div class="page-head"><div class="crumbs"><a href="${href('/cart')}" data-link>Кошик</a> / Оформлення</div><h1>Оформлення замовлення</h1></div>
+      <form class="two form" novalidate data-form>
+        <div>
+          <h2>Контакти</h2>
+          <div class="fields cols">
+            <div class="field"><label for="ln">Прізвище</label><input id="ln" name="lastName" autocomplete="family-name" required value="${esc(saved.lastName || '')}"></div>
+            <div class="field"><label for="fn">Імʼя</label><input id="fn" name="firstName" autocomplete="given-name" required value="${esc(saved.firstName || '')}"></div>
+            <div class="field"><label for="ph">Телефон</label><input id="ph" name="phone" type="tel" inputmode="tel" autocomplete="tel" placeholder="+380 __ ___ __ __" required value="${esc(saved.phone || '')}"></div>
+            <div class="field"><label for="em">Email <span class="muted">(необовʼязково)</span></label><input id="em" name="email" type="email" autocomplete="email" value="${esc(saved.email || '')}"></div>
+          </div>
+          <input name="website" tabindex="-1" autocomplete="off" style="position:absolute;left:-9999px" aria-hidden="true">
+
+          <h2>Доставка</h2>
+          <div class="choices">
+            <label class="choice"><input type="radio" name="dm" value="np" checked><span><b>Нова пошта — відділення або поштомат</b><small>За тарифами перевізника. Великі матраци — у вантажне відділення.</small></span></label>
+            <label class="choice"><input type="radio" name="dm" value="np_courier"><span><b>Курʼєр Нової пошти до дверей</b><small>За тарифами перевізника</small></span></label>
+            <label class="choice"><input type="radio" name="dm" value="pickup"><span><b>Самовивіз з магазину</b><small>Безкоштовно</small></span></label>
+          </div>
+          <div class="fields" style="margin-top:14px" data-np>
+            <div class="field combo"><label for="city">Місто</label><input id="city" autocomplete="off" placeholder="Почніть вводити назву" value="${esc(saved.cityName || '')}"></div>
+            <div class="field combo" data-wh-field><label for="wh">Відділення або поштомат</label><input id="wh" autocomplete="off" placeholder="${cfg.npSearch ? 'Номер або вулиця' : 'Наприклад: Відділення №12'}"></div>
+            <div class="field" data-addr-field hidden><label for="addr">Адреса: вулиця, будинок, квартира</label><input id="addr" autocomplete="street-address"></div>
+          </div>
+          <div class="fields" style="margin-top:14px" data-pickup hidden>
+            <div class="field"><label for="st">Магазин</label><select id="st">${cfg.stores.map((s) => `<option>${esc(s)}</option>`).join('')}</select></div>
+          </div>
+
+          <h2>Оплата</h2>
+          <div class="choices" data-pay></div>
+
+          <h2>Коментар</h2>
+          <div class="field"><label for="cm" class="sr">Коментар до замовлення</label><textarea id="cm" rows="3" placeholder="Наприклад, зручний час для дзвінка"></textarea></div>
+        </div>
+        <aside class="summary"><h2>Ваше замовлення</h2>
+          <ul class="sum-items">${lines.map((l) => `<li><span>${esc(l.p.name)}${l.v.label !== 'Стандарт' ? ' ' + esc(l.v.label) : ''}${l.v.opt ? ', ' + esc(l.v.opt) : ''} × ${l.qty}</span><span>${money(l.v.price * l.qty)}</span></li>`).join('')}</ul>
+          <div class="sum-row"><span>Доставка</span><span class="muted">за тарифами перевізника</span></div>
+          <div class="sum-row sum-total"><span>До сплати</span><span>${money(total)}</span></div>
+          ${hasOut ? '<p class="note">Частина товарів під замовлення — менеджер підтвердить термін після дзвінка.</p>' : ''}
+          <button class="btn btn-primary btn-block" style="margin-top:16px" type="submit" data-submit>Підтвердити замовлення</button>
+          <div class="form-error" data-err hidden></div>
+          <p class="agree">Після оформлення менеджер звʼяжеться з вами для підтвердження.</p>
+        </aside>
+      </form></div>`;
+
+    const form = $('[data-form]');
+    let city = saved.cityRef ? { ref: saved.cityRef, name: saved.cityName } : null;
+    let wh = null;
+    const cityIn = $('#city'), whIn = $('#wh');
+    if (cfg.npSearch) {
+      combo(cityIn, { load: (q) => api(`/api/np/cities?q=${encodeURIComponent(q)}`), onPick: (it) => { city = it; if (!it) { wh = null; whIn.value = ''; } else whIn.focus(); } });
+      combo(whIn, { minLen: 0, empty: 'Спочатку оберіть місто', load: (q) => (city ? api(`/api/np/warehouses?city=${city.ref}&q=${encodeURIComponent(q)}`) : Promise.resolve([])), onPick: (it) => { wh = it; } });
+    }
+
+    const drawPay = () => {
+      const dm = form.dm.value;
+      const opts = [];
+      if (cfg.payOnline) opts.push(['online', 'Карткою онлайн', 'Visa, Mastercard, Apple Pay, Google Pay — через monobank']);
+      if (dm === 'pickup') opts.push(['store', 'Оплата в магазині', 'Готівкою або карткою при отриманні']);
+      else opts.push(['cod', 'Накладений платіж', 'Оплата при отриманні на пошті (+ комісія Нової пошти за переказ)']);
+      const cur = form.pay?.value;
+      $('[data-pay]').innerHTML = opts.map(([v, t, s], i) => `<label class="choice"><input type="radio" name="pay" value="${v}" ${(cur ? cur === v : i === 0) ? 'checked' : ''}><span><b>${t}</b><small>${s}</small></span></label>`).join('');
+      if (!form.pay.value || ![...$$('[name=pay]')].some((r) => r.checked)) $$('[name=pay]')[0].checked = true;
+      $('[data-submit]').textContent = form.pay.value === 'online' ? `Перейти до оплати ${money(total)}` : 'Підтвердити замовлення';
+    };
+    const drawDelivery = () => {
+      const dm = form.dm.value;
+      $('[data-np]').hidden = dm === 'pickup';
+      $('[data-pickup]').hidden = dm !== 'pickup';
+      $('[data-wh-field]').hidden = dm !== 'np';
+      $('[data-addr-field]').hidden = dm !== 'np_courier';
+      drawPay();
+    };
+    drawDelivery();
+    form.addEventListener('change', (e) => { if (e.target.name === 'dm') drawDelivery(); if (e.target.name === 'pay') drawPay(); });
+
+    const err = $('[data-err]');
+    const fieldErr = (input, msg) => {
+      const f = input.closest('.field');
+      f.classList.add('invalid');
+      let m = $('.err', f);
+      if (!m) { m = document.createElement('div'); m.className = 'err'; f.appendChild(m); }
+      m.textContent = msg;
+    };
+    form.addEventListener('input', (e) => { const f = e.target.closest('.field'); if (f) { f.classList.remove('invalid'); $('.err', f)?.remove(); } });
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      err.hidden = true;
+      $$('.field.invalid', form).forEach((f) => { f.classList.remove('invalid'); $('.err', f)?.remove(); });
+      const dm = form.dm.value;
+      const v = { lastName: form.lastName.value.trim(), firstName: form.firstName.value.trim(), phone: form.phone.value.trim(), email: form.email.value.trim() };
+      const bad = [];
+      if (!v.lastName) bad.push([form.lastName, 'Вкажіть прізвище']);
+      if (!v.firstName) bad.push([form.firstName, 'Вкажіть імʼя']);
+      if (v.phone.replace(/\D/g, '').length < 9) bad.push([form.phone, 'Вкажіть номер телефону, наприклад 067 123 45 67']);
+      if (v.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v.email)) bad.push([form.email, 'Перевірте email']);
+      const cityName = cfg.npSearch ? city?.name : cityIn.value.trim();
+      if (dm !== 'pickup' && !cityName) bad.push([cityIn, cfg.npSearch ? 'Оберіть місто зі списку' : 'Вкажіть місто']);
+      const whName = cfg.npSearch ? wh?.name : whIn.value.trim();
+      if (dm === 'np' && !whName) bad.push([whIn, cfg.npSearch ? 'Оберіть відділення зі списку' : 'Вкажіть відділення']);
+      if (dm === 'np_courier' && !$('#addr').value.trim()) bad.push([$('#addr'), 'Вкажіть адресу']);
+      if (bad.length) { bad.forEach(([i, m]) => fieldErr(i, m)); bad[0][0].focus(); return; }
+
+      store.set('buyer101', { ...v, cityName: cityName || '', cityRef: city?.ref || '' });
+      const btn = $('[data-submit]');
+      btn.disabled = true;
+      const label = btn.textContent;
+      btn.textContent = 'Оформлюємо…';
+      try {
+        const r = await api('/api/order', {
+          method: 'POST',
+          body: JSON.stringify({
+            items: getCart().map((l) => ({ id: l.id, qty: l.qty })),
+            customer: v,
+            delivery: { method: dm, cityName, cityRef: city?.ref, warehouseName: whName, warehouseRef: wh?.ref, address: $('#addr').value.trim(), store: $('#st').value },
+            payment: form.pay.value,
+            comment: $('#cm').value.trim(),
+            website: form.website.value,
+          }),
+        });
+        store.set('lastOrder101', { ref: r.ref, number: r.number, total: r.total, pay: form.pay.value });
+        saveCart([]);
+        if (r.payUrl) { location.href = r.payUrl; return; }
+        navigate(`/order/${r.ref}`);
+        window.scrollTo(0, 0);
+      } catch (ex) {
+        err.textContent = ex.message || 'Не вдалося оформити замовлення';
+        err.hidden = false;
+        btn.disabled = false;
+        btn.textContent = label;
+        if (ex.data && ex.data.staleId) { saveCart(getCart().filter((l) => l.id !== String(ex.data.staleId))); }
+      }
+    });
+  });
+
+  // ------------------------------------------------------------------ Дякуємо
+  route(/^\/order\/([\w]+)$/, async (m) => {
+    setTitle('Замовлення оформлено');
+    const last = store.get('lastOrder101', {});
+    const ref = m[1];
+    const show = (o) => {
+      const num = o.number || last.number || ref;
+      const paid = o.paid;
+      const pendingPay = (o.pay || last.pay) === 'online' && !paid;
+      app.innerHTML = `<div class="wrap"><div class="done">
+        <div class="mark"><svg width="30" height="30" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h1>${paid ? 'Оплату отримано, дякуємо!' : 'Дякуємо, замовлення прийнято'}</h1>
+        <p>Номер замовлення: <span class="num">${esc(num)}</span></p>
+        <p class="muted">${paid ? 'Ми вже бачимо оплату. ' : ''}Менеджер звʼяжеться з вами найближчим часом, щоб підтвердити деталі${cfgPhone()}.</p>
+        ${pendingPay ? `<div class="form-error" style="background:var(--lav);color:var(--ink)">Оплата ще не надійшла. Якщо ви закрили сторінку банку, можна оплатити ще раз.<div style="margin-top:12px"><button class="btn btn-primary" data-repay>Оплатити замовлення</button></div></div>` : ''}
+        <p style="margin-top:28px"><a class="btn btn-ghost" href="${href('/')}" data-link>Повернутися до каталогу</a></p>
+      </div></div>`;
+      $('[data-repay]')?.addEventListener('click', async (e) => {
+        e.target.disabled = true;
+        try { const r = await api(`/api/order/${ref}/pay`, { method: 'POST' }); location.href = r.payUrl; } catch (ex) { toast(esc(ex.message)); e.target.disabled = false; }
+      });
+    };
+    show({});
+    try { const o = await api(`/api/order/${ref}`); if (o.found) show(o); } catch {}
+  });
+  const cfgPhone = () => (state.config.phone ? `. Телефон магазину: <a href="tel:${esc(state.config.phone.replace(/[^\d+]/g, ''))}">${esc(state.config.phone)}</a>` : '');
+
+  function notFound() {
+    setTitle('Сторінку не знайдено');
+    app.innerHTML = `<div class="wrap"><div class="empty"><h1 style="font-size:28px;margin-bottom:10px">Такої сторінки немає</h1><p class="muted">Можливо, товар уже зняли з продажу.</p><a class="btn btn-primary" href="${href('/')}" data-link>На головну</a></div></div>`;
+  }
+  route(/.*/, notFound);
+
+  // ------------------------------------------------------------------ Старт
+  function drawChrome() {
+    $('[data-cats]').innerHTML = state.categories.map((c) => `<a href="${href('/c/' + c.id)}" data-link>${esc(c.name)}</a>`).join('') + (state.products.some((p) => p.disc > 0) ? `<a class="sale" href="${href('/sale')}" data-link>Знижки</a>` : '');
+    const cfg = state.config;
+    $('[data-footer]').innerHTML = `
+      <div><a href="${href('/')}" class="logo" data-link><span class="logo-num">101</span>matras</a><p>Матраци, топери, подушки та ковдри. Ціни й наявність оновлюються автоматично.</p>${cfg.phone ? `<p><a href="tel:${esc(cfg.phone.replace(/[^\d+]/g, ''))}">${esc(cfg.phone)}</a></p>` : ''}</div>
+      <div><h3>Каталог</h3><ul>${state.categories.map((c) => `<li><a href="${href('/c/' + c.id)}" data-link>${esc(c.name)}</a></li>`).join('')}</ul></div>
+      <div><h3>Наші магазини</h3><ul>${cfg.stores.map((s) => `<li>${esc(s)}</li>`).join('')}</ul></div>`;
+  }
+
+  $('[data-search]').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const q = $('#q').value.trim();
+    navigate(q ? `/search?q=${encodeURIComponent(q)}` : '/');
+    window.scrollTo(0, 0);
+  });
+
+  async function boot() {
+    try {
+      const [config, cat] = await Promise.all([api('/api/config'), api('/api/catalog')]);
+      state.config = config;
+      state.products = cat.products;
+      state.categories = cat.categories;
+      state.brands = cat.brands;
+      for (const p of cat.products) { state.byId[p.id] = p; for (const v of p.variants) state.variants[v.id] = { p, v }; }
+      // прибрати з кошика товари, яких більше немає
+      const c = getCart().filter((l) => state.variants[l.id]);
+      if (c.length !== getCart().length) saveCart(c);
+      if (DEMO) document.body.insertAdjacentHTML('afterbegin', '<div class="demo-bar">Демо-версія з частиною каталогу: замовлення звідси нікуди не відправляються.</div>');
+      drawChrome();
+      updateCartBadge();
+      render();
+    } catch (e) {
+      const msg = e.status === 503 ? 'Каталог оновлюється. Сторінка перезавантажиться автоматично.' : 'Не вдалося завантажити каталог. Перевірте інтернет і оновіть сторінку.';
+      $('#app').innerHTML = `<div class="wrap loading">${msg}</div>`;
+      if (e.status === 503) setTimeout(boot, 8000);
+    }
+  }
+  boot();
+})();

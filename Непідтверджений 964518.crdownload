@@ -1,0 +1,261 @@
+// Розбір XML-вигрузки Хорошопа (YML) у каталог магазину.
+// Кожен <offer> — це окремий розмір; offer-и з однаковим group_id — одна модель.
+
+const TYPE_NAMES = {
+  mattresses: 'Матраци',
+  toppers: 'Топери',
+  kids: 'Дитячі матраци',
+  protectors: 'Наматрацники',
+  pillows: 'Подушки',
+  blankets: 'Ковдри',
+  other: 'Інше',
+};
+const TYPE_ORDER = ['mattresses', 'toppers', 'kids', 'protectors', 'pillows', 'blankets', 'other'];
+
+// Позиції «розмір під замовлення / за м²» не продаємо онлайн — у них ціна за м², а не за штуку.
+const CUSTOM_RE = /(під|под)\s*замов|на\s*замовлення|под\s*заказ|(розмір|размер)\s*(під|под)|м2\b|м²/i;
+const SIZE_RE = /(\d{2,3})\s*[хХxX×*]\s*(\d{2,3})(\s*(см|cm)\.?)?/;
+
+function decodeEntities(s) {
+  if (!s) return '';
+  return s
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(+n))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)))
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
+function attrs(str) {
+  const out = {};
+  const re = /([\w:-]+)\s*=\s*"([^"]*)"/g;
+  let m;
+  while ((m = re.exec(str))) out[m[1]] = decodeEntities(m[2]);
+  return out;
+}
+
+function tagText(body, tag) {
+  const m = body.match(new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</${tag}>`));
+  return m ? decodeEntities(m[1]).trim() : '';
+}
+function tagAll(body, tag) {
+  const re = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</${tag}>`, 'g');
+  const out = [];
+  let m;
+  while ((m = re.exec(body))) out.push(decodeEntities(m[1]).trim());
+  return out;
+}
+
+// ---------- безпечний HTML для опису ----------
+const ALLOWED = new Set(['p', 'br', 'b', 'strong', 'i', 'em', 'u', 'h2', 'h3', 'h4', 'ul', 'ol', 'li',
+  'table', 'thead', 'tbody', 'tr', 'td', 'th', 'img', 'span', 'div', 'sup', 'sub']);
+function sanitizeHtml(html) {
+  if (!html) return '';
+  let s = html
+    .replace(/<(script|style|iframe|object|embed|form|noscript|svg|video|audio)[\s\S]*?<\/\1>/gi, '')
+    .replace(/<!--[\s\S]*?-->/g, '');
+  s = s.replace(/<\/?([a-z0-9]+)([^>]*)>/gi, (full, tag, rest) => {
+    const t = tag.toLowerCase();
+    const closing = full.startsWith('</');
+    if (!ALLOWED.has(t)) return '';
+    if (t === 'h2') return closing ? '</h3>' : '<h3>';
+    if (closing) return `</${t}>`;
+    if (t === 'img') {
+      const a = attrs(rest);
+      if (!a.src || !/^https:\/\//i.test(a.src)) return '';
+      return `<img src="${a.src.replace(/"/g, '')}" alt="" loading="lazy">`;
+    }
+    return `<${t}>`;
+  });
+  s = s
+    .replace(/<p>(\s|&nbsp;|<br>)*<\/p>/gi, '')
+    .replace(/(<br>\s*){3,}/gi, '<br><br>')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  return s;
+}
+
+function plainText(html) {
+  return decodeEntities(String(html || '').replace(/<[^>]+>/g, '\n').replace(/&nbsp;/g, ' '))
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n\s*\n+/g, '\n');
+}
+
+// ---------- характеристики з тексту опису ----------
+function extractAttrs(text, type) {
+  const a = {};
+  const t = text.replace(/\n/g, ' ');
+  if (type === 'mattresses' || type === 'kids' || type === 'toppers') {
+    if (/безпружин|беспружин/i.test(t)) a.spring = 'Безпружинний';
+    else if (/пружинн|пружин(ний|ному)\s*бло|pocket|покет|bonnel|боннел|незалежн\S*\s+пружин/i.test(t)) a.spring = 'Пружинний';
+    if (type === 'toppers') delete a.spring;
+  }
+  const th = t.replace(/\((?:допуск)?\s*\+\s*\/?\s*-?\s*\d+\s*(?:мм|см)\)/gi, ' ').replace(/\+\s*\/\s*-\s*\d+\s*(?:мм|см)/gi, ' ');
+  let m = th.match(/висот\S*[^\d]{0,45}?(\d{1,2}(?:[.,]\d)?)\s*см/i);
+  if (m && type !== 'protectors' && type !== 'blankets') {
+    const h = parseFloat(m[1].replace(',', '.'));
+    if (h >= 2 && h <= 45) a.height = h;
+  }
+  m = t.match(/жорсткіст\S*\s*:\s*([^;.\n]{3,50})/i);
+  if (m) {
+    const f = m[1].replace(/^[\s:–-]+/, '').trim();
+    if (f && /м[’'`]?я?к|середн|жорстк|комфорт|тверд/i.test(f)) {
+      a.firmness = f.charAt(0).toUpperCase() + f.slice(1);
+      const tags = [];
+      const g = f.replace(/жорсткост\S*/gi, '');
+      if (/м[’'`]?я?кий|м[’'`]?як|м'кий/i.test(g)) tags.push("М'яка");
+      if (/середн|комфорт/i.test(g)) tags.push('Середня');
+      if (/жорстк|тверд/i.test(g)) tags.push('Жорстка');
+      if (tags.length) a.firmTags = tags;
+    }
+  }
+  m = t.match(/навантаження\S*[^\d]{0,30}?(\d{2,3})\s*кг/i);
+  if (m) a.load = +m[1];
+  else if (/навантаження\S*\s*:?\s*без\s+обмеж/i.test(t)) a.load = 'без обмеження';
+  if (/вакуумн|у\s+рулон|в\s+рулон|скрутк/i.test(t)) a.roll = true;
+  return a;
+}
+
+function detectType(name, categoryId) {
+  const n = name.toLowerCase();
+  if (/^(топп?ер|міні[\s-]*матра|мини[\s-]*матра)/.test(n)) return 'toppers';
+  if (/^(наматра|чохол)/.test(n)) return 'protectors';
+  if (/подушк/.test(n) && !/^матра/.test(n)) return 'pillows';
+  if (/ковдр|одеял|плед/.test(n)) return 'blankets';
+  if (categoryId === '1068' || /дитяч|детск/.test(n)) return 'kids';
+  if (/^матра/.test(n)) return 'mattresses';
+  return { '1062': 'protectors', '1063': 'blankets', '1064': 'pillows', '1061': 'mattresses' }[categoryId] || 'other';
+}
+
+function cleanName(name, sizeMatch) {
+  let s = name;
+  if (sizeMatch) s = s.replace(sizeMatch[0], ' ');
+  return s.replace(/\(\s*\)/g, '').replace(/\s+[-–,]\s*$/, '').replace(/\s{2,}/g, ' ').trim();
+}
+
+function num(v) {
+  const n = parseFloat(String(v || '').replace(',', '.'));
+  return Number.isFinite(n) ? Math.round(n) : 0;
+}
+
+function parseFeed(xml) {
+  const offers = [];
+  const re = /<offer\b([^>]*)>([\s\S]*?)<\/offer>/g;
+  let m;
+  while ((m = re.exec(xml))) {
+    const at = attrs(m[1]);
+    const body = m[2];
+    offers.push({
+      id: at.id,
+      group: at.group_id || at.id,
+      available: at.available === 'true',
+      url: tagText(body, 'url'),
+      price: num(tagText(body, 'price')),
+      oldprice: num(tagText(body, 'oldprice')),
+      categoryId: tagText(body, 'categoryId'),
+      pictures: tagAll(body, 'picture'),
+      sku: tagText(body, 'vendorCode'),
+      vendor: tagText(body, 'vendor').replace(/\s+/g, ' ').trim(),
+      name: tagText(body, 'name').replace(/\s+/g, ' ').trim(),
+      description: tagText(body, 'description'),
+      warranty: (body.match(/<param[^>]*name="Гарантия"[^>]*>([^<]*)<\/param>/) || [])[1] || '',
+    });
+  }
+
+  const groups = new Map();
+  let skippedCustom = 0;
+  for (const o of offers) {
+    if (!o.id || !o.price) continue;
+    if (CUSTOM_RE.test(o.name)) { skippedCustom++; continue; }
+    if (!groups.has(o.group)) groups.set(o.group, []);
+    groups.get(o.group).push(o);
+  }
+
+  const products = [];
+  const descriptions = {};
+  const variantIndex = {};
+  for (const [gid, list] of groups) {
+    const first = list[0];
+    const desc = list.find((o) => o.description)?.description || '';
+    const type = detectType(first.name, first.categoryId);
+    const sm = first.name.match(SIZE_RE);
+    const name = cleanName(first.name, sm);
+    const groupPics = first.pictures;
+
+    let variants = list.map((o) => {
+      const s = o.name.match(SIZE_RE);
+      const v = {
+        id: o.id,
+        label: s ? `${s[1]}×${s[2]}` : '',
+        w: s ? +s[1] : 0,
+        l: s ? +s[2] : 0,
+        price: o.price,
+        old: o.oldprice > o.price ? o.oldprice : 0,
+        av: o.available,
+        sku: o.sku,
+      };
+      if (o.pictures.length && o.pictures.join() !== groupPics.join()) v.pics = o.pictures;
+      return v;
+    });
+    // однакові підписи (або без розміру) — беремо відмінну частину назви
+    const counts = {};
+    variants.forEach((v) => (counts[v.label] = (counts[v.label] || 0) + 1));
+    const words = list.map((o) => o.name.split(' '));
+    let common = 0;
+    while (words.every((w) => w[common] !== undefined && w[common] === words[0][common])) common++;
+    variants.forEach((v, i) => {
+      if (!v.label || counts[v.label] > 1) {
+        // відмінна частина назви без розміру — це «варіант» (тканина, тип кріплення, вага ковдри…)
+        const rest = words[i].slice(common).join(' ').replace(SIZE_RE, ' ').replace(/\s+см\b/g, ' ').replace(/\s{2,}/g, ' ').trim();
+        if (v.label) v.opt = rest || 'Стандарт';
+        else v.label = rest || 'Стандарт';
+      }
+    });
+    variants.sort((a, b) => a.w - b.w || a.l - b.l || a.price - b.price);
+    const hasOpts = variants.some((v) => v.opt) || (variants.length > 1 && variants.every((v) => !v.w));
+
+    const text = plainText(desc);
+    const prices = variants.map((v) => v.price);
+    const minPrice = Math.min(...prices);
+    const cheapest = variants.find((v) => v.price === minPrice);
+    const maxDisc = Math.max(0, ...variants.map((v) => (v.old ? Math.round((1 - v.price / v.old) * 100) : 0)));
+
+    const p = {
+      id: gid,
+      name: hasOpts && common >= 2 ? words[0].slice(0, common).join(' ') : name,
+      brand: first.vendor,
+      type,
+      pics: groupPics.length ? groupPics : (variants.find((v) => v.pics)?.pics || []),
+      minPrice,
+      maxPrice: Math.max(...prices),
+      oldMin: cheapest.old || 0,
+      disc: maxDisc,
+      inStock: variants.some((v) => v.av),
+      warranty: first.warranty,
+      siteUrl: first.url,
+      attrs: extractAttrs(text, type),
+      variants,
+    };
+    products.push(p);
+    descriptions[gid] = sanitizeHtml(desc);
+    for (const v of variants) variantIndex[v.id] = { product: p, variant: v };
+  }
+
+  products.sort((a, b) => TYPE_ORDER.indexOf(a.type) - TYPE_ORDER.indexOf(b.type) || (b.inStock - a.inStock) || b.disc - a.disc);
+
+  const categories = TYPE_ORDER.map((id) => ({ id, name: TYPE_NAMES[id], count: products.filter((p) => p.type === id).length }))
+    .filter((c) => c.count);
+
+  return {
+    products,
+    descriptions,
+    variantIndex,
+    categories,
+    stats: { offers: offers.length, models: products.length, variants: Object.keys(variantIndex).length, skippedCustom },
+  };
+}
+
+module.exports = { parseFeed, sanitizeHtml, extractAttrs, TYPE_NAMES };

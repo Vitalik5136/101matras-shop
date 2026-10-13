@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>101matras</title>
+<!--META-->
+<meta name="theme-color" content="#573D79">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@600;700;800&family=Onest:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<a class="skip" href="#app">Перейти до вмісту</a>
+<header class="top">
+  <div class="top-in wrap">
+    <a href="/" class="logo" data-link aria-label="101matras — на головну"><span class="logo-num">101</span>matras</a>
+    <form class="search" role="search" data-search>
+      <label class="sr" for="q">Пошук товарів</label>
+      <input id="q" name="q" type="search" placeholder="Пошук: матрац, топер, бренд…" autocomplete="off">
+      <button type="submit" aria-label="Шукати"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/><path d="m20 20-4.2-4.2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+    </form>
+    <a href="/cart" class="cart-btn" data-link aria-label="Кошик">
+      <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="M3 4h2l2.2 11h11l2-8H7" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/><circle cx="9" cy="19.5" r="1.5" fill="currentColor"/><circle cx="17" cy="19.5" r="1.5" fill="currentColor"/></svg>
+      <span class="cart-label">Кошик</span>
+      <span class="cart-count" data-cart-count hidden>0</span>
+    </a>
+  </div>
+  <nav class="cats wrap" aria-label="Категорії" data-cats></nav>
+</header>
+<main id="app" tabindex="-1"><div class="loading wrap">Завантажуємо каталог…</div></main>
+<footer class="foot">
+  <div class="wrap foot-in" data-footer></div>
+</footer>
+<div class="toast" role="status" aria-live="polite" data-toast></div>
+<script src="/app.js"></script>
+</body>
+</html>

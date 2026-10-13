@@ -1,0 +1,43 @@
+// Еквайринг monobank (plata by mono): створення рахунку та перевірка статусу.
+const S = require('./settings');
+
+const BASE = process.env.MONO_BASE_URL || 'https://api.monobank.ua';
+
+async function call(method, path, body) {
+  if (!S.monoToken) throw new Error('MONO_TOKEN не задано');
+  const res = await fetch(BASE + path, {
+    method,
+    headers: { 'X-Token': S.monoToken, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(20000),
+  });
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  if (!res.ok) throw new Error(`monobank ${path} → ${res.status}: ${text.slice(0, 300)}`);
+  return data;
+}
+
+// amount — у гривнях; monobank приймає копійки
+async function createInvoice({ amount, reference, destination, redirectUrl, webHookUrl }) {
+  return call('POST', '/api/merchant/invoice/create', {
+    amount: Math.round(amount * 100),
+    ccy: 980,
+    merchantPaymInfo: { reference: String(reference), destination: destination.slice(0, 280) },
+    redirectUrl,
+    webHookUrl,
+    validity: 60 * 60 * 24,
+    paymentType: 'debit',
+  });
+}
+
+// Статус перевіряємо прямо в банку — тому вебхуку не треба вірити на слово
+async function invoiceStatus(invoiceId) {
+  return call('GET', `/api/merchant/invoice/status?invoiceId=${encodeURIComponent(invoiceId)}`);
+}
+
+async function merchantDetails() {
+  return call('GET', '/api/merchant/details');
+}
+
+module.exports = { createInvoice, invoiceStatus, merchantDetails, enabled: () => !!S.monoToken };

@@ -1,0 +1,42 @@
+// Пошук міст і відділень Нової пошти (для форми оформлення)
+const S = require('./settings');
+
+const URL = 'https://api.novaposhta.ua/v2.0/json/';
+const cache = new Map();
+
+async function np(modelName, calledMethod, methodProperties) {
+  const key = JSON.stringify([modelName, calledMethod, methodProperties]);
+  const hit = cache.get(key);
+  if (hit && hit.t > Date.now() - 6 * 3600e3) return hit.v;
+  const res = await fetch(URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ apiKey: S.npApiKey, modelName, calledMethod, methodProperties }),
+    signal: AbortSignal.timeout(15000),
+  });
+  const d = await res.json();
+  if (!d.success) throw new Error(`НП ${calledMethod}: ${(d.errors || []).join('; ')}`);
+  if (cache.size > 2000) cache.clear();
+  cache.set(key, { t: Date.now(), v: d.data });
+  return d.data;
+}
+
+async function searchCities(q) {
+  const data = await np('Address', 'searchSettlements', { CityName: q, Limit: '20', Page: '1' });
+  const list = (data[0] && data[0].Addresses) || [];
+  return list
+    .filter((a) => a.Warehouses > 0 && a.DeliveryCity)
+    .map((a) => ({ ref: a.DeliveryCity, name: a.Present }));
+}
+
+async function warehouses(cityRef, q = '') {
+  const data = await np('Address', 'getWarehouses', { CityRef: cityRef, FindByString: q, Limit: '60', Page: '1', Language: 'UA' });
+  return data.map((w) => ({
+    ref: w.Ref,
+    name: w.Description,
+    postomat: /поштомат/i.test(w.CategoryOfWarehouse === 'Postomat' ? 'поштомат' : w.Description),
+    maxKg: +w.PlaceMaxWeightAllowed || +w.TotalMaxWeightAllowed || 0,
+  }));
+}
+
+module.exports = { searchCities, warehouses, enabled: () => !!S.npApiKey };

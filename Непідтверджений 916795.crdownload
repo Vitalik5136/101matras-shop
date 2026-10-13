@@ -1,0 +1,89 @@
+// Мінімальний клієнт KeyCRM OpenAPI (https://openapi.keycrm.app/v1)
+const S = require('./settings');
+
+const BASE = process.env.KEYCRM_BASE_URL || 'https://openapi.keycrm.app/v1';
+
+async function request(method, path, body) {
+  if (!S.keycrmToken) throw new Error('KEYCRM_API_KEY не задано');
+  const res = await fetch(BASE + path, {
+    method,
+    headers: {
+      Authorization: `Bearer ${S.keycrmToken}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(20000),
+  });
+  const text = await res.text();
+  let data;
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+  if (!res.ok) {
+    const err = new Error(`KeyCRM ${method} ${path} → ${res.status}: ${text.slice(0, 500)}`);
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+const list = async (path) => {
+  const d = await request('GET', `${path}${path.includes('?') ? '&' : '?'}limit=50`);
+  return Array.isArray(d) ? d : d.data || [];
+};
+
+let cachedSourceId = null;
+async function resolveSourceId() {
+  if (S.keycrmSourceId) return +S.keycrmSourceId;
+  if (cachedSourceId) return cachedSourceId;
+  // Якщо ID не задано — шукаємо джерело з назвою «сайт / магазин / site / shop»
+  const sources = await list('/order/source');
+  const found = sources.find((s) => /сайт|site|магазин|shop|web/i.test(`${s.name} ${s.alias || ''}`)) || sources[0];
+  cachedSourceId = found ? found.id : null;
+  return cachedSourceId;
+}
+
+async function createOrder(payload) {
+  const source_id = await resolveSourceId();
+  const body = { ...payload };
+  if (source_id) body.source_id = source_id;
+  return request('POST', '/order', body);
+}
+
+// Позначити замовлення оплаченим
+async function addPayment(orderId, { amount, description }) {
+  const body = {
+    amount,
+    status: 'paid',
+    description: description || 'Оплата карткою (monobank)',
+    payment_date: new Date().toISOString().replace('T', ' ').slice(0, 19),
+  };
+  if (S.keycrmPaymentMethodId) body.payment_method_id = +S.keycrmPaymentMethodId;
+  else body.payment_method = 'monobank';
+  return request('POST', `/order/${orderId}/payment`, body);
+}
+
+async function getOrder(orderId) {
+  return request('GET', `/order/${orderId}?include=payments`);
+}
+
+async function appendManagerComment(orderId, line) {
+  try {
+    const o = await request('GET', `/order/${orderId}`);
+    const prev = o.manager_comment || '';
+    return request('PUT', `/order/${orderId}`, { manager_comment: `${prev}${prev ? '\n' : ''}${line}` });
+  } catch (e) {
+    console.error('[keycrm] comment', e.message);
+  }
+}
+
+module.exports = {
+  request,
+  createOrder,
+  addPayment,
+  getOrder,
+  appendManagerComment,
+  listSources: () => list('/order/source'),
+  listPaymentMethods: () => list('/order/payment-method'),
+  listDeliveryServices: () => list('/order/delivery-service'),
+};

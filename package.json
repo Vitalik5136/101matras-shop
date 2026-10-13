@@ -1,0 +1,18 @@
+{
+  "name": "101matras-shop",
+  "version": "1.0.0",
+  "description": "Інтернет-магазин 101matras: каталог з вигрузки Хорошопа, кошик, оплата monobank, замовлення в KeyCRM",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "sample": "node test/make-sample-feed.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "compression": "^1.7.4",
+    "express": "^4.21.2"
+  }
+}

@@ -1,0 +1,38 @@
+// Усі налаштування магазину. Секретні ключі задаються НЕ тут, а у змінних середовища
+// (на Railway: вкладка Variables / «Змінні»). Тут — значення за замовчуванням.
+
+const env = (k, d = '') => (process.env[k] !== undefined && process.env[k] !== '' ? process.env[k] : d);
+
+module.exports = {
+  port: +env('PORT', 3000),
+  // Адреса вигрузки Хорошопа (YML/XML)
+  feedUrl: env('FEED_URL', 'https://101matras.ua/content/export/bf5ada79a4036e96ecc39bc3173ff7a2.xml'),
+  // Як часто оновлювати каталог, хвилин
+  feedRefreshMin: +env('FEED_REFRESH_MIN', 180),
+  // Публічна адреса магазину (потрібна для повернення з оплати). Якщо не задана — визначається автоматично.
+  publicUrl: env('PUBLIC_URL', '').replace(/\/$/, ''),
+
+  shopName: env('SHOP_NAME', '101matras'),
+  shopPhone: env('SHOP_PHONE', ''),
+  // Пароль для сторінки перевірки /admin
+  adminKey: env('ADMIN_KEY', ''),
+
+  // ---- KeyCRM ----
+  keycrmToken: env('KEYCRM_API_KEY', ''),
+  keycrmSourceId: env('KEYCRM_SOURCE_ID', ''),
+  keycrmPaymentMethodId: env('KEYCRM_PAYMENT_METHOD_ID', ''),
+
+  // ---- monobank (plata by mono) ----
+  monoToken: env('MONO_TOKEN', ''),
+
+  // ---- Нова пошта ----
+  npApiKey: env('NP_API_KEY', ''),
+
+  // ---- Telegram (запасне сповіщення про кожне замовлення, необовʼязково) ----
+  tgBotToken: env('TG_BOT_TOKEN', ''),
+  tgChatId: env('TG_CHAT_ID', ''),
+
+  // Магазини для самовивозу. Можна перевизначити змінною STORES: назви через «;»
+  stores: env('STORES', 'Харків, ТЦ «Маршал»;Харків, ТЦ «Феромон»;Люботин;Львів;Івано-Франківськ')
+    .split(';').map((s) => s.trim()).filter(Boolean),
+};
