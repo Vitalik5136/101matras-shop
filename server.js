@@ -652,6 +652,19 @@ app.get('/api/config', (req, res) => {
   });
 });
 
+// Службова перевірка: версія файлу і НАЗВИ змінних, які бачить сервер (без значень)
+const VERSION = '2026-10-14-d';
+app.get('/api/diag', (req, res) => {
+  const skip = /^(PATH|HOME|HOSTNAME|PWD|SHLVL|TERM|LANG|_|NODE_|NPM_|YARN_|npm_|NIXPACKS|RAILPACK|RAILWAY_|HOST$|PORT$|OLDPWD|LD_|SSL_|CA_|MISE|BUN_)/;
+  res.json({
+    version: VERSION,
+    service: process.env.RAILWAY_SERVICE_NAME || null,
+    variables: Object.keys(process.env).filter((k) => !skip.test(k)).sort(),
+    monoTokenFound: !!S.monoToken,
+    keycrmKeyFound: !!S.keycrmToken,
+  });
+});
+
 app.get('/api/catalog', needCatalog, (req, res) => {
   res.set('Cache-Control', 'public, max-age=300');
   res.type('json').send(catalogJson);
