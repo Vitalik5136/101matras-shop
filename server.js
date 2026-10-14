@@ -23,7 +23,7 @@ module.exports = {
   shopName: env('SHOP_NAME', '101matras'),
   shopPhone: env('SHOP_PHONE', ''),
   // Пароль для сторінки перевірки /admin
-  adminKey: env('ADMIN_KEY', ''),
+  adminKey: env('ADMIN_KEY', 'matras2026'),
 
   // ---- KeyCRM ----
   keycrmToken: env('KEYCRM_API_KEY', ''),
@@ -360,11 +360,47 @@ async function resolveSourceId() {
   return cachedSourceId;
 }
 
+let lastError = null; // остання помилка KeyCRM — показуємо на сторінці /admin
+
 async function createOrder(payload) {
-  const source_id = await resolveSourceId();
+  let source_id = null;
+  try { source_id = await resolveSourceId(); } catch (e) { console.error('[keycrm] джерела:', e.message); }
   const body = { ...payload };
   if (source_id) body.source_id = source_id;
-  return request('POST', '/order', body);
+  try {
+    const r = await request('POST', '/order', body);
+    lastError = null;
+    return r;
+  } catch (e) {
+    lastError = { at: new Date().toISOString(), message: e.message };
+    // ключ невірний — повторювати немає сенсу
+    if (e.status === 401 || e.status === 403) throw e;
+    console.error('[keycrm] повне замовлення відхилено, пробую спрощене:', e.message);
+    // Спрощене замовлення: лише покупець і товари, усе інше — в коментар менеджеру
+    const sh = payload.shipping || {};
+    const simple = {
+      ...(source_id ? { source_id } : {}),
+      source_uuid: payload.source_uuid,
+      buyer: payload.buyer,
+      manager_comment: [
+        payload.manager_comment,
+        `Отримувач: ${sh.recipient_full_name || ''} ${sh.recipient_phone || ''}`,
+        sh.shipping_address_city ? `Місто: ${sh.shipping_address_city}` : '',
+        sh.shipping_receive_point ? `Відділення / магазин: ${sh.shipping_receive_point}` : '',
+        sh.shipping_secondary_line ? `Адреса: ${sh.shipping_secondary_line}` : '',
+        payload.buyer_comment ? `Коментар покупця: ${payload.buyer_comment}` : '',
+      ].filter(Boolean).join('\n'),
+      products: (payload.products || []).map((p) => ({ sku: p.sku, name: p.name, price: p.price, quantity: p.quantity })),
+    };
+    try {
+      const r = await request('POST', '/order', simple);
+      lastError = { ...lastError, note: 'повне замовлення не пройшло, спрощене — пройшло' };
+      return r;
+    } catch (e2) {
+      lastError = { at: new Date().toISOString(), message: e2.message, first: e.message };
+      throw e2;
+    }
+  }
 }
 
 // Позначити замовлення оплаченим
@@ -395,6 +431,7 @@ async function appendManagerComment(orderId, line) {
 }
 
 module.exports = {
+  lastError: () => lastError,
   request,
   createOrder,
   addPayment,
@@ -930,7 +967,9 @@ app.get('/admin', async (req, res) => {
       const [src, pm] = await Promise.all([keycrm.listSources(), keycrm.listPaymentMethods().catch(() => [])]);
       const srcList = src.map((s) => `${s.id} — ${esc(s.name)}`).join('<br>');
       const pmList = pm.map((s) => `${s.id} — ${esc(s.name)}`).join('<br>');
-      rows.push(row(true, 'KeyCRM', `Подключено.<br><br><b>Источники продаж</b> (ID — название). Сейчас используется: ${S.keycrmSourceId || 'выбирается автоматически'}<br>${srcList || '—'}<br><br><b>Способы оплаты</b>. Сейчас: ${S.keycrmPaymentMethodId || 'не задан (запишется как «monobank»)'}<br>${pmList || '—'}`));
+      const le = keycrm.lastError();
+      const leText = le ? `<br><br><b>Последняя ошибка при отправке заказа</b> (${esc(le.at)}): ${esc(le.message)}${le.first ? '<br>Первая попытка: ' + esc(le.first) : ''}${le.note ? '<br>' + esc(le.note) : ''}` : '';
+      rows.push(row(true, 'KeyCRM', `Подключено.${leText}<br><br><b>Источники продаж</b> (ID — название). Сейчас используется: ${S.keycrmSourceId || 'выбирается автоматически'}<br>${srcList || '—'}<br><br><b>Способы оплаты</b>. Сейчас: ${S.keycrmPaymentMethodId || 'не задан (запишется как «monobank»)'}<br>${pmList || '—'}`));
     } catch (e) {
       rows.push(row(false, 'KeyCRM', 'Ключ задан, но KeyCRM ответил ошибкой: ' + esc(e.message)));
     }
