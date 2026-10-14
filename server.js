@@ -788,14 +788,31 @@ app.post('/api/order', needCatalog, async (req, res) => {
       ...lines.filter((l) => !l.v.av).length ? ['Є позиції «під замовлення» — уточнити термін у постачальника'] : [],
     ].join('\n');
 
+    // «м. Львів, Львівська обл.» → місто «Львів», область «Львівська обл.»
+    const cityParts = city.split(',').map((x) => x.trim());
+    const cityShort = (cityParts[0] || city).replace(/^(м\.|смт|с\.|селище|село)\s*/i, '').trim();
+    const region = cityParts.find((x) => /обл\./i.test(x)) || '';
+
     const shipping = { recipient_full_name: fullName, recipient_phone: phone };
-    if (method === 'pickup') Object.assign(shipping, { shipping_service: 'Самовивіз', shipping_receive_point: store });
-    else {
-      Object.assign(shipping, { shipping_service: 'Нова Пошта', shipping_address_city: city, shipping_address_country: 'Ukraine' });
+    if (method === 'pickup') {
+      Object.assign(shipping, { shipping_service: 'Самовивіз', shipping_receive_point: store, shipping_address_city: store.split(',')[0] });
+    } else {
+      // delivery_service_id: служба доставки в KeyCRM (1 = «Новою поштою на Склад», як у сервера Мономаркету).
+      // Без неї KeyCRM не показує блок доставки в замовленні.
+      Object.assign(shipping, {
+        delivery_service_id: +(process.env.KEYCRM_NP_DELIVERY_ID || 1),
+        shipping_service: 'Нова Пошта',
+        shipping_address_city: cityShort,
+        shipping_address_region: region,
+        shipping_address_country: 'Україна',
+      });
       if (method === 'np') {
         shipping.shipping_receive_point = warehouse;
         if (d.warehouseRef) shipping.warehouse_ref = clean(d.warehouseRef, 60);
-      } else shipping.shipping_secondary_line = address;
+      } else {
+        shipping.shipping_secondary_line = address;
+        if (process.env.KEYCRM_NP_COURIER_ID) shipping.delivery_service_id = +process.env.KEYCRM_NP_COURIER_ID;
+      }
     }
 
     const payload = {
