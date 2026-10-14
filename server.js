@@ -463,17 +463,30 @@ const S = __req('settings');
 const URL = 'https://api.novaposhta.ua/v2.0/json/';
 const cache = new Map();
 
+// Пошук міст і відділень у Нової пошти працює і без ключа.
+// Якщо ключ задано, але він прострочений або невірний — повторюємо запит без ключа.
+let keyBroken = false;
+async function call(apiKey, modelName, calledMethod, methodProperties) {
+  const res = await fetch(URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ apiKey, modelName, calledMethod, methodProperties }),
+    signal: AbortSignal.timeout(15000),
+  });
+  return res.json();
+}
+
 async function np(modelName, calledMethod, methodProperties) {
   const key = JSON.stringify([modelName, calledMethod, methodProperties]);
   const hit = cache.get(key);
   if (hit && hit.t > Date.now() - 6 * 3600e3) return hit.v;
-  const res = await fetch(URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ apiKey: S.npApiKey, modelName, calledMethod, methodProperties }),
-    signal: AbortSignal.timeout(15000),
-  });
-  const d = await res.json();
+  const useKey = S.npApiKey && !keyBroken ? S.npApiKey : '';
+  let d = await call(useKey, modelName, calledMethod, methodProperties);
+  if (!d.success && useKey && (d.errors || []).some((e) => /api key/i.test(e))) {
+    keyBroken = true;
+    console.error('[НП] ключ не працює (' + d.errors.join('; ') + ') — шукаю без ключа');
+    d = await call('', modelName, calledMethod, methodProperties);
+  }
   if (!d.success) throw new Error(`НП ${calledMethod}: ${(d.errors || []).join('; ')}`);
   if (cache.size > 2000) cache.clear();
   cache.set(key, { t: Date.now(), v: d.data });
@@ -498,7 +511,7 @@ async function warehouses(cityRef, q = '') {
   }));
 }
 
-module.exports = { searchCities, warehouses, enabled: () => !!S.npApiKey };
+module.exports = { searchCities, warehouses, enabled: () => process.env.NP_SEARCH !== 'off', keyBroken: () => keyBroken };
 
 return module.exports; })();
 
@@ -930,12 +943,11 @@ app.get('/admin', async (req, res) => {
     } catch (e) { rows.push(row(false, 'monobank', 'Токен задан, но банк ответил ошибкой: ' + esc(e.message))); }
   } else rows.push(row(null, 'monobank', 'Не подключено — на сайте доступны только наложенный платёж и оплата в магазине'));
 
-  if (np.enabled()) {
-    try {
-      const c = await np.searchCities('Київ');
-      rows.push(row(c.length > 0, 'Нова пошта', c.length ? 'Поиск городов и отделений работает' : 'Ключ задан, но поиск ничего не вернул'));
-    } catch (e) { rows.push(row(false, 'Нова пошта', esc(e.message))); }
-  } else rows.push(row(null, 'Нова пошта', 'Не задан NP_API_KEY — клиент вводит город и отделение вручную'));
+  try {
+    const c = await np.searchCities('Київ');
+    const note = np.keyBroken() ? ' (ключ NP_API_KEY просрочен — работает без ключа, это нормально)' : '';
+    rows.push(row(c.length > 0, 'Нова пошта', (c.length ? 'Поиск городов и отделений работает' : 'Поиск ничего не вернул') + note));
+  } catch (e) { rows.push(row(false, 'Нова пошта', esc(e.message))); }
 
   rows.push(row(S.tgBotToken && S.tgChatId ? true : null, 'Telegram-копия заказов', S.tgBotToken && S.tgChatId ? 'Включено' : 'Выключено (необязательно)'));
   rows.push(row(S.publicUrl ? true : null, 'Адрес магазина (PUBLIC_URL)', S.publicUrl || `не задан, определяется автоматически: ${esc(baseUrl(req))}`));
