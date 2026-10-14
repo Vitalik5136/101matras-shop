@@ -11,6 +11,19 @@ __m['settings'] = (function () { const module = { exports: {} }; const exports =
 
 const env = (k, d = '') => (process.env[k] !== undefined && process.env[k] !== '' ? process.env[k] : d);
 
+// Запасний варіант для токена monobank: файл mono-token.txt поруч із server.js (у приватному репозиторії GitHub)
+function tokenFromFile() {
+  const fs = require('fs');
+  const path = require('path');
+  for (const name of ['mono-token.txt', 'mono_token.txt', 'MONO_TOKEN.txt', 'mono-token', 'MONO_TOKEN']) {
+    try {
+      const t = fs.readFileSync(path.join(__dirname, name), 'utf8').replace(/^\s*MONO_TOKEN\s*=\s*/i, '').trim().replace(/^["']|["']$/g, '');
+      if (t) return t;
+    } catch {}
+  }
+  return '';
+}
+
 module.exports = {
   port: +env('PORT', 3000),
   // Адреса вигрузки Хорошопа (YML/XML)
@@ -35,7 +48,7 @@ module.exports = {
 
   // ---- monobank (plata by mono) ----
   // Токен monobank. Приймаємо і інші написання імені (MONOBANK_TOKEN, mono_token, X-Token тощо)
-  monoToken: (env('MONO_TOKEN', '') || (Object.entries(process.env).find(([k, v]) => /mono|plata|x.?token/i.test(k) && !/_URL$/i.test(k) && v && v.trim()) || [])[1] || '').trim().replace(/^["']|["']$/g, ''),
+  monoToken: (env('MONO_TOKEN', '').trim() || tokenFromFile() || (Object.entries(process.env).find(([k, v]) => /mono|plata|x.?token/i.test(k) && !/_URL$/i.test(k) && v && v.trim()) || [])[1] || '').trim().replace(/^["']|["']$/g, ''),
 
   // ---- Нова пошта ----
   npApiKey: env('NP_API_KEY', ''),
@@ -653,7 +666,7 @@ app.get('/api/config', (req, res) => {
 });
 
 // Службова перевірка: версія файлу і НАЗВИ змінних, які бачить сервер (без значень)
-const VERSION = '2026-10-14-d';
+const VERSION = '2026-10-14-e';
 app.get('/api/diag', (req, res) => {
   const skip = /^(PATH|HOME|HOSTNAME|PWD|SHLVL|TERM|LANG|_|NODE_|NPM_|YARN_|npm_|NIXPACKS|RAILPACK|RAILWAY_|HOST$|PORT$|OLDPWD|LD_|SSL_|CA_|MISE|BUN_)/;
   res.json({
