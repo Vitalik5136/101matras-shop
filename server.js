@@ -34,7 +34,8 @@ module.exports = {
   keycrmPaymentMethodId: env('KEYCRM_PAYMENT_METHOD_ID', ''),
 
   // ---- monobank (plata by mono) ----
-  monoToken: env('MONO_TOKEN', ''),
+  // Токен monobank. Приймаємо і інші написання імені (MONOBANK_TOKEN, mono_token, X-Token тощо)
+  monoToken: (env('MONO_TOKEN', '') || (Object.entries(process.env).find(([k, v]) => /mono|plata|x.?token/i.test(k) && !/_URL$/i.test(k) && v && v.trim()) || [])[1] || '').trim().replace(/^["']|["']$/g, ''),
 
   // ---- Нова пошта ----
   npApiKey: env('NP_API_KEY', ''),
